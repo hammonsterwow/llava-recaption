@@ -1,0 +1,8 @@
+torch>=2.3
+torchvision
+accelerate
+bitsandbytes
+qwen-vl-utils==0.0.8
+tqdm
+Pillow
+git+https://github.com/huggingface/transformers
