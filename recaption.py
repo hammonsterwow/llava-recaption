@@ -225,10 +225,18 @@ def main():
     indexed = list(enumerate(all_samples))
     shard = indexed[args.shard_id::args.num_shards]
 
-    if args.limit is not None:
-        shard = shard[:args.limit]
-
     done_ids = load_done_ids(out_path)
+
+    # Exclude completed images before selecting this run's batch.
+    remaining = [
+        item for item in shard
+        if str(item[1]["id"]) not in done_ids
+    ]
+
+    if args.limit is not None:
+        shard = remaining[:args.limit]
+    else:
+        shard = remaining
     print(f"Total samples: {len(all_samples):,}")
     print(f"Shard {args.shard_id}/{args.num_shards}: {len(shard):,}")
     print(f"Already completed in shard: {len(done_ids):,}")
