@@ -1,0 +1,21 @@
+Generate a detailed and visually grounded description of the image.
+
+Describe all visually salient information, including:
+- the overall scene and setting,
+- objects and people,
+- visual attributes such as color, shape, material, appearance, and state,
+- actions,
+- interactions between objects or people,
+- spatial relationships between objects,
+- relevant background elements,
+- and clearly visible text when applicable.
+
+Pay particular attention to individual objects and their relationships.
+
+Only describe information that is visually supported by the image.
+Do not infer hidden intentions, identities, causes, locations, brands,
+or events unless they are clearly visible.
+
+Write one coherent, detailed natural-language paragraph.
+Avoid unnecessary repetition.
+The length should adapt to the visual complexity of the image.

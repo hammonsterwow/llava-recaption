@@ -17,25 +17,29 @@ from transformers import (
 from qwen_vl_utils import process_vision_info
 
 
+# Exact prompt provided for the recaptioning run. Keep this text unchanged for
+# the full dataset so every sample is generated under the same instructions.
 DEFAULT_PROMPT = """Generate a detailed and visually grounded description of the image.
 
 Describe all visually salient information, including:
 - the overall scene and setting,
-- salient objects and people,
-- important visual attributes such as color, shape, material, appearance, count, and state,
-- actions and interactions,
+- objects and people,
+- visual attributes such as color, shape, material, appearance, and state,
+- actions,
+- interactions between objects or people,
 - spatial relationships between objects,
-- relevant foreground and background elements,
-- and clearly legible text when applicable.
+- relevant background elements,
+- and clearly visible text when applicable.
 
-Pay particular attention to individual objects, their attributes, and pairwise relationships.
+Pay particular attention to individual objects and their relationships.
+
 Only describe information that is visually supported by the image.
-Do not infer hidden intentions, identities, causes, exact locations, brands, or events unless they are clearly visible.
-Do not add generic world knowledge that is not supported by the image.
+Do not infer hidden intentions, identities, causes, locations, brands,
+or events unless they are clearly visible.
 
 Write one coherent, detailed natural-language paragraph.
 Avoid unnecessary repetition.
-The description length should adapt to the visual complexity of the image.
+The length should adapt to the visual complexity of the image.
 """
 
 
@@ -53,15 +57,12 @@ def parse_args():
     p.add_argument("--max-visual-tokens", type=int, default=512)
     p.add_argument("--max-new-tokens", type=int, default=256)
 
-    # TITAN Xp: fp16 saves memory but may be slow on Pascal.
-    # Benchmark fp16 vs fp32 on a small subset if desired.
     p.add_argument(
         "--compute-dtype",
         choices=["fp16", "fp32"],
         default="fp16",
         help="bitsandbytes 4-bit compute dtype",
     )
-
     p.add_argument(
         "--model-dtype",
         choices=["fp16", "fp32"],
@@ -69,8 +70,12 @@ def parse_args():
         help="dtype for non-quantized modules; fp16 is recommended for 12 GB VRAM",
     )
 
-    p.add_argument("--limit", type=int, default=None,
-                   help="Process only N samples from this shard; useful for smoke tests.")
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process only N remaining samples from this shard.",
+    )
     p.add_argument("--prompt-file", type=str, default=None)
     p.add_argument("--flush-every", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
@@ -83,6 +88,59 @@ def dtype_from_name(name):
     if name == "fp32":
         return torch.float32
     raise ValueError(name)
+
+
+def repair_trailing_jsonl(path: Path):
+    """Repair only a partially written final JSONL record.
+
+    A hard shutdown can leave the last line without a newline. If that final
+    line is valid JSON, add the missing newline. If it is malformed, truncate
+    only that final partial record so it can be regenerated on resume.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return
+
+    with path.open("rb+") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(size - 1)
+        if f.read(1) == b"\n":
+            return
+
+        pos = size - 1
+        line_start = 0
+        chunk_size = 64 * 1024
+
+        while pos >= 0:
+            start = max(0, pos - chunk_size + 1)
+            f.seek(start)
+            chunk = f.read(pos - start + 1)
+            newline_at = chunk.rfind(b"\n")
+            if newline_at != -1:
+                line_start = start + newline_at + 1
+                break
+            if start == 0:
+                line_start = 0
+                break
+            pos = start - 1
+
+        f.seek(line_start)
+        tail = f.read()
+
+        try:
+            json.loads(tail.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            f.seek(line_start)
+            f.truncate()
+            f.flush()
+            os.fsync(f.fileno())
+            print(f"[WARN] removed partial final JSONL record from {path}")
+        else:
+            f.seek(0, os.SEEK_END)
+            f.write(b"\n")
+            f.flush()
+            os.fsync(f.fileno())
+            print(f"[WARN] added missing final newline to {path}")
 
 
 def load_done_ids(path: Path):
@@ -100,8 +158,9 @@ def load_done_ids(path: Path):
                 if row.get("id") is not None and str(row.get("caption", "")).strip():
                     done.add(str(row["id"]))
             except json.JSONDecodeError:
-                # A final partially-written line can occur if a job is killed mid-write.
-                # Ignore it; the sample will be regenerated.
+                # Internal malformed records should not normally occur. Do not
+                # treat them as completed; the corresponding sample can be
+                # regenerated on a later run.
                 print(f"[WARN] malformed JSONL at {path}:{line_no}; ignoring")
     return done
 
@@ -114,7 +173,6 @@ def append_jsonl(f, obj, flush=False):
 
 
 def make_messages(image_path: Path, prompt: str, min_vtokens: int, max_vtokens: int):
-    # Qwen docs explicitly support local files via file:// URI.
     uri = image_path.resolve().as_uri()
     return [
         {
@@ -174,9 +232,7 @@ def generate_caption(
         use_cache=True,
     )
 
-    # Remove prompt tokens.
     trimmed = generated_ids[:, inputs.input_ids.shape[1]:]
-
     caption = processor.batch_decode(
         trimmed,
         skip_special_tokens=True,
@@ -218,16 +274,20 @@ def main():
     out_path = output_dir / f"part_{args.shard_id:02d}.jsonl"
     err_path = output_dir / f"errors_{args.shard_id:02d}.jsonl"
 
+    # Repair only a crash-truncated final line before reading/appending files.
+    repair_trailing_jsonl(out_path)
+    repair_trailing_jsonl(err_path)
+
     with input_json.open("r", encoding="utf-8") as f:
         all_samples = json.load(f)
 
-    # Deterministic interleaved sharding: 0,4,8... / 1,5,9... etc.
     indexed = list(enumerate(all_samples))
     shard = indexed[args.shard_id::args.num_shards]
 
     done_ids = load_done_ids(out_path)
 
-    # Exclude completed images before selecting this run's batch.
+    # Resume semantics: remove successful IDs first, then apply the per-run
+    # limit. Re-running with the same output directory therefore moves forward.
     remaining = [
         item for item in shard
         if str(item[1]["id"]) not in done_ids
@@ -237,9 +297,16 @@ def main():
         shard = remaining[:args.limit]
     else:
         shard = remaining
+
     print(f"Total samples: {len(all_samples):,}")
-    print(f"Shard {args.shard_id}/{args.num_shards}: {len(shard):,}")
+    print(f"Remaining in shard before limit: {len(remaining):,}")
+    print(f"This run on shard {args.shard_id}/{args.num_shards}: {len(shard):,}")
     print(f"Already completed in shard: {len(done_ids):,}")
+
+    # Avoid spending time/VRAM loading the model when this shard is complete.
+    if not shard:
+        print(f"Shard {args.shard_id} has no remaining samples. Nothing to do.")
+        return
 
     if args.prompt_file:
         prompt = Path(args.prompt_file).read_text(encoding="utf-8").strip()
@@ -261,7 +328,6 @@ def main():
         f"model_dtype={model_dtype}"
     )
 
-    # Each process should see exactly one GPU through CUDA_VISIBLE_DEVICES.
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model,
         quantization_config=quant_config,
@@ -282,7 +348,6 @@ def main():
     errors = 0
     start_time = time.time()
 
-    # Line-buffered append. fsync cadence is configurable.
     with out_path.open("a", encoding="utf-8", buffering=1) as fout, \
          err_path.open("a", encoding="utf-8", buffering=1) as ferr:
 
@@ -326,7 +391,6 @@ def main():
                         max_new_tokens=args.max_new_tokens,
                     )
                 except Exception as e:
-                    # If only this image OOMs, retry at the minimum token budget.
                     if is_cuda_oom(e) and args.max_visual_tokens > args.min_visual_tokens:
                         print(
                             f"\n[OOM] id={sample_id}; retrying with "
